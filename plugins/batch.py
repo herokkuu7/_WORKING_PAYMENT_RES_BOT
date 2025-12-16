@@ -587,8 +587,6 @@
 
 
 
-
-
 # Copyright (c) 2025 devgagan : https://github.com/devgaganin.  
 # Licensed under the GNU General Public License v3.0.  
 # See LICENSE file in the repository root for full license text.
@@ -824,7 +822,7 @@ async def send_direct(c, m, tcid, ft=None, rtmid=None):
         return False
 
 # ==============================================================================
-# MODIFIED PROCESS_MSG WITH FIXES FOR DISK CLEANUP AND 0KB FILES
+# FINAL FIXED PROCESS_MSG WITH ZIP SAFETY AND DISK CLEANUP
 # ==============================================================================
 async def process_msg(c, u, m, d, lt, uid, i):
     try:
@@ -878,9 +876,7 @@ async def process_msg(c, u, m, d, lt, uid, i):
                 await c.edit_message_text(d, p.id, 'Failed.')
                 return 'Failed.'
             
-            # -------------------------------------------------------------------------
-            # FIX: Check if the downloaded file is 0KB (Disk Full Error) and delete it
-            # -------------------------------------------------------------------------
+            # DISK FULL CHECK: Delete empty files immediately
             if os.path.exists(f) and os.path.getsize(f) == 0:
                 os.remove(f)
                 await c.edit_message_text(d, p.id, 'Failed: Disk Full (0KB file).')
@@ -896,22 +892,29 @@ async def process_msg(c, u, m, d, lt, uid, i):
             
             fsize = os.path.getsize(f) / (1024 * 1024 * 1024)
             th = thumbnail(d)
-            
-            # FIX: Track generated thumbnail to delete it later
             generated_thumb = None
 
             if fsize > 2 and Y:
                 st = time.time()
                 await c.edit_message_text(d, p.id, 'File is larger than 2GB. Using alternative method...')
                 await upd_dlg(Y)
+                
+                # FIX: SAFETY CHECK FOR ZIP FILES RENAMED AS VIDEO
+                video_extensions = ['.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm', '.m4v', '.3gp', '.ogv']
+                file_ext = os.path.splitext(f)[1].lower()
+                dur, h, w = 0, 0, 0
+                
+                # Only try to get metadata if it REALLY looks like a video
+                if m.video or (m.document and file_ext in video_extensions):
+                    try:
+                        mtd = await get_video_metadata(f)
+                        dur, h, w = mtd['duration'], mtd['width'], mtd['height']
+                        generated_thumb = await screenshot(f, dur, d)
+                        th = generated_thumb
+                    except Exception as e:
+                        print(f"Metadata extraction failed (safe fail): {e}")
+
                 try:
-                    mtd = await get_video_metadata(f)
-                    dur, h, w = mtd['duration'], mtd['width'], mtd['height']
-                    
-                    # Store generated thumb path
-                    generated_thumb = await screenshot(f, dur, d)
-                    th = generated_thumb
-                    
                     send_funcs = {'video': Y.send_video, 'video_note': Y.send_video_note, 
                                 'voice': Y.send_voice, 'audio': Y.send_audio, 
                                 'photo': Y.send_photo, 'document': Y.send_document}
@@ -932,7 +935,6 @@ async def process_msg(c, u, m, d, lt, uid, i):
                     
                     await c.copy_message(d, LOG_GROUP, sent.id)
                 finally:
-                    # FIX: Force cleanup of large file and thumb
                     if os.path.exists(f): 
                         os.remove(f)
                     if generated_thumb and os.path.exists(generated_thumb): 
@@ -948,52 +950,57 @@ async def process_msg(c, u, m, d, lt, uid, i):
                 video_extensions = ['.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm', '.m4v', '.3gp', '.ogv']
                 audio_extensions = ['.mp3', '.wav', '.flac', '.aac', '.ogg', '.wma', '.m4a', '.opus', '.aiff', '.ac3']
                 file_ext = os.path.splitext(f)[1].lower()
+                
+                uploaded = False
+                
+                # FIX: TRY-EXCEPT BLOCK TO CATCH "ZIP RENAMED AS MP4" ERRORS
                 if m.video or (m.document and file_ext in video_extensions):
-                    mtd = await get_video_metadata(f)
-                    dur, h, w = mtd['duration'], mtd['width'], mtd['height']
-                    
-                    # Store generated thumb path
-                    generated_thumb = await screenshot(f, dur, d)
-                    th = generated_thumb
-                    
-                    await c.send_video(tcid, video=f, caption=ft if m.caption else None, 
-                                    thumb=th, width=w, height=h, duration=dur, 
-                                    progress=prog, progress_args=(c, d, p.id, st), 
-                                    reply_to_message_id=rtmid)
-                elif m.video_note:
-                    await c.send_video_note(tcid, video_note=f, progress=prog, 
-                                        progress_args=(c, d, p.id, st), reply_to_message_id=rtmid)
-                elif m.voice:
-                    await c.send_voice(tcid, f, progress=prog, progress_args=(c, d, p.id, st), 
-                                    reply_to_message_id=rtmid)
-                elif m.sticker:
-                    await c.send_sticker(tcid, m.sticker.file_id, reply_to_message_id=rtmid)
-                elif m.audio or (m.document and file_ext in audio_extensions):
-                    await c.send_audio(tcid, audio=f, caption=ft if m.caption else None, 
-                                    thumb=th, progress=prog, progress_args=(c, d, p.id, st), 
-                                    reply_to_message_id=rtmid)
-                elif m.photo:
-                    await c.send_photo(tcid, photo=f, caption=ft if m.caption else None, 
-                                    progress=prog, progress_args=(c, d, p.id, st), 
-                                    reply_to_message_id=rtmid)
-                elif m.document:
-                    await c.send_document(tcid, document=f, caption=ft if m.caption else None, 
+                    try:
+                        mtd = await get_video_metadata(f)
+                        dur, h, w = mtd['duration'], mtd['width'], mtd['height']
+                        generated_thumb = await screenshot(f, dur, d)
+                        th = generated_thumb
+                        
+                        await c.send_video(tcid, video=f, caption=ft if m.caption else None, 
+                                        thumb=th, width=w, height=h, duration=dur, 
                                         progress=prog, progress_args=(c, d, p.id, st), 
                                         reply_to_message_id=rtmid)
-                else:
-                    await c.send_document(tcid, document=f, caption=ft if m.caption else None, 
+                        uploaded = True
+                    except Exception as e:
+                        print(f"Failed to upload as video (likely zip file): {e}")
+                        uploaded = False # Fallback to document
+                
+                if not uploaded:
+                    if m.video_note:
+                        await c.send_video_note(tcid, video_note=f, progress=prog, 
+                                            progress_args=(c, d, p.id, st), reply_to_message_id=rtmid)
+                    elif m.voice:
+                        await c.send_voice(tcid, f, progress=prog, progress_args=(c, d, p.id, st), 
+                                        reply_to_message_id=rtmid)
+                    elif m.sticker:
+                        await c.send_sticker(tcid, m.sticker.file_id, reply_to_message_id=rtmid)
+                    elif m.audio or (m.document and file_ext in audio_extensions):
+                        await c.send_audio(tcid, audio=f, caption=ft if m.caption else None, 
+                                        thumb=th, progress=prog, progress_args=(c, d, p.id, st), 
+                                        reply_to_message_id=rtmid)
+                    elif m.photo:
+                        await c.send_photo(tcid, photo=f, caption=ft if m.caption else None, 
                                         progress=prog, progress_args=(c, d, p.id, st), 
                                         reply_to_message_id=rtmid)
+                    else:
+                        # Fallback for ZIPs and others
+                        await c.send_document(tcid, document=f, caption=ft if m.caption else None, 
+                                            progress=prog, progress_args=(c, d, p.id, st), 
+                                            reply_to_message_id=rtmid)
             except Exception as e:
                 await c.edit_message_text(d, p.id, f'Upload failed: {str(e)[:30]}')
-                # FIX: Cleanup on error
                 if os.path.exists(f): 
                     os.remove(f)
                 if generated_thumb and os.path.exists(generated_thumb): 
                     os.remove(generated_thumb)
                 return 'Failed.'
             
-            # FIX: Cleanup on success
+            # CLEANUP ON SUCCESS
             if os.path.exists(f): 
                 os.remove(f)
             if generated_thumb and os.path.exists(generated_thumb): 
