@@ -1248,7 +1248,6 @@
 
 
 
-
 # Copyright (c) 2025 devgagan : https://github.com/devgaganin.  
 # Licensed under the GNU General Public License v3.0.  
 # See LICENSE file in the repository root for full license text.
@@ -1256,7 +1255,7 @@
 import os, re, time, asyncio, json
 from pyrogram import Client, filters
 from pyrogram.types import Message
-from pyrogram.errors import UserNotParticipant, FloodWait
+from pyrogram.errors import UserNotParticipant, FloodWait, PeerIdInvalid, ChannelPrivate
 from config import API_ID, API_HASH, LOG_GROUP, STRING, FORCE_SUB, FREEMIUM_LIMIT, PREMIUM_LIMIT
 from utils.func import get_user_data, screenshot, thumbnail, get_video_metadata
 from utils.func import get_user_data_key, process_text_with_rules, is_premium_user, E
@@ -1268,7 +1267,10 @@ from utils.encrypt import dcs
 from typing import Dict, Any, Optional
 
 Y = None if not STRING else __import__('shared_client').userbot
-Z, P, UB, UC, emp = {}, {}, {}, {}, {}
+Z, P, UB, UC = {}, {}, {}, {}
+
+# Removed 'emp' cache as it was causing logic errors. 
+# We will rely on direct try/except blocks.
 
 ACTIVE_USERS = {}
 ACTIVE_USERS_FILE = "active_users.json"
@@ -1328,79 +1330,114 @@ ACTIVE_USERS = load_active_users()
 
 async def upd_dlg(c):
     try:
-        async for _ in c.get_dialogs(limit=5000): pass
+        # Optimized: Scan 2000. If we go too high (5000+), it risks FloodWait/Timeout
+        # This populates the internal cache.
+        async for _ in c.get_dialogs(limit=2000): pass
         return True
     except Exception as e:
         print(f'Failed to update dialogs: {e}')
         return False
 
+# ==============================================================================
+#  SMART MESSAGE FETCHER (PUBLIC & PRIVATE)
+# ==============================================================================
 async def get_msg(c, u, i, d, lt):
     try:
+        # ----------------------
+        # PUBLIC CHANNELS
+        # ----------------------
         if lt == 'public':
+            # 1. Try with BOT Client (c) first. 
+            # Bots can read public channels without joining. This is the most effective method.
             try:
-                if str(i).lower().endswith('bot'):
-                    emp[i] = False
-                    xm = await u.get_messages(i, d)
-                    emp[i] = getattr(xm, "empty", False)
-                    if not emp[i]:
-                        emp[i] = True
-                        print(f"Bot chat found successfully...")
-                        return xm
-                
-                # FIXED: Changed emp[i] to emp.get(i, False) to avoid KeyError
-                if emp.get(i, False):
-                    xm = await c.get_messages(i, d)
-                    if not getattr(xm, "empty", False):
-                        return xm
-                
-                try: await u.join_chat(i)
-                except: pass
-                
-                xm = await u.get_messages(i, d)
-                if getattr(xm, "empty", False):
-                    return None
-                return xm                   
-            except Exception as e:
-                print(f'Error fetching public message: {e}')
-                return None
-        else:
+                msg = await c.get_messages(i, d)
+                if not getattr(msg, "empty", False):
+                    return msg
+            except Exception:
+                pass
+
+            # 2. Try with USERBOT (u)
             if u:
                 try:
-                    chat_id = str(i)
-                    if chat_id.startswith("-100"):
-                        final_id = int(chat_id)
-                    elif chat_id.startswith("-"):
-                        final_id = int(f"-100{chat_id[1:]}")
+                    msg = await u.get_messages(i, d)
+                    if not getattr(msg, "empty", False):
+                        return msg
+                except Exception:
+                    pass
+
+                # 3. If Userbot failed, it might need to JOIN.
+                try:
+                    print(f"Joining public chat {i}...")
+                    await u.join_chat(i)
+                    await asyncio.sleep(2) # Wait for join to propagate
+                    msg = await u.get_messages(i, d)
+                    if not getattr(msg, "empty", False):
+                        return msg
+                except Exception as e:
+                    print(f"Failed to join/fetch public chat: {e}")
+                    pass
+
+            return None
+
+        # ----------------------
+        # PRIVATE CHANNELS
+        # ----------------------
+        else:
+            if u:
+                # 1. ID Normalization (Handle -100, -, and integer formats)
+                try:
+                    chat_id = int(i)
+                    if str(chat_id).startswith("-100"):
+                        final_id = chat_id
+                    elif str(chat_id).startswith("-"):
+                        final_id = int(f"-100{str(chat_id)[1:]}")
                     else:
                         final_id = int(f"-100{chat_id}")
-
-                    try:
-                        msg = await u.get_messages(final_id, d)
-                        if msg and not getattr(msg, "empty", False):
-                            return msg
-                    except Exception:
-                        pass
-                    
-                    try:
-                        async for dialog in u.get_dialogs(limit=5000):
-                            if dialog.chat.id == final_id:
-                                break
-                    except Exception:
-                        pass
-                    
-                    try:
-                        msg = await u.get_messages(final_id, d)
-                        if msg and not getattr(msg, "empty", False):
-                            return msg
-                    except Exception:
-                        return None
-                            
-                except Exception as e:
-                    print(f'Private channel error: {e}')
+                except ValueError:
+                    print(f"Invalid ID format: {i}")
                     return None
+
+                # 2. Attempt Direct Fetch (Fastest)
+                try:
+                    msg = await u.get_messages(final_id, d)
+                    if not getattr(msg, "empty", False):
+                        return msg
+                except Exception:
+                    pass
+
+                # 3. Attempt Cache Refresh via get_chat (Mid-Speed)
+                # This fetches the "Access Hash" from Telegram if the ID is valid
+                try:
+                    await u.get_chat(final_id)
+                    msg = await u.get_messages(final_id, d)
+                    if not getattr(msg, "empty", False):
+                        return msg
+                except Exception:
+                    pass
+
+                # 4. Attempt Dialog Scan (Slowest, Last Resort)
+                # We iterate up to 2000. Crucially: We BREAK if we find it.
+                try:
+                    print(f"Scanning dialogs for {final_id}...")
+                    found = False
+                    async for dialog in u.get_dialogs(limit=2000):
+                        if dialog.chat.id == final_id:
+                            found = True
+                            break # Stop scanning once found!
+                    
+                    if found:
+                        msg = await u.get_messages(final_id, d)
+                        if not getattr(msg, "empty", False):
+                            return msg
+                except Exception as e:
+                    print(f"Dialog scan error: {e}")
+                    pass
+
+                return None
             return None
+
     except Exception as e:
-        print(f'Error fetching message: {e}')
+        print(f'Critical Error in get_msg: {e}')
         return None
 
 async def get_ubot(uid):
@@ -1428,6 +1465,7 @@ async def get_uclient(uid):
             ss = dcs(xxx)
             gg = Client(f'{uid}_client', api_id=API_ID, api_hash=API_HASH, device_model="v3saver", session_string=ss)
             await gg.start()
+            # Initial Dialog Update
             await upd_dlg(gg)
             UC[uid] = gg
             return gg
@@ -1505,9 +1543,11 @@ async def process_msg(c, u, m, d, lt, uid, i):
             ft = f'{proc_text}\n\n{user_cap}' if proc_text and user_cap else user_cap if user_cap else proc_text
             
             # PUBLIC CLONING LOGIC
-            if lt == 'public' and not emp.get(i, False):
-                await send_direct(c, m, tcid, ft, rtmid)
-                return 'Sent directly.'
+            # Note: Removed check for 'emp' as we want to attempt send_direct for all public links first
+            if lt == 'public':
+                sent = await send_direct(c, m, tcid, ft, rtmid)
+                if sent:
+                    return 'Sent directly.'
             
             st = time.time()
             p = await c.send_message(d, 'Downloading...')
@@ -1827,7 +1867,7 @@ async def text_handler(c, m):
                     try: await pt.edit(f'{j+1}/{n}: Error - {str(e)[:30]}')
                     except: pass
                 
-                await asyncio.sleep(6) # CHANGED FROM 10 TO 6 AS REQUESTED
+                await asyncio.sleep(6) # Retained 6s delay
             
             if j+1 == n:
                 await m.reply_text(f'Batch Completed ✅ Success: {success}/{n}')
@@ -1835,3 +1875,4 @@ async def text_handler(c, m):
         finally:
             await remove_active_batch(uid)
             Z.pop(uid, None)
+
